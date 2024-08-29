@@ -17,6 +17,8 @@ find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(camera_info_manager REQUIRED)
 find_package(cv_bridge REQUIRED)
+find_package(std_srvs REQUIRED)
+find_package(image_transport REQUIRED)
 pkg_check_modules(libcamera REQUIRED libcamera>=0.1)
 
 # library with common utility functions for type conversions
@@ -52,6 +54,8 @@ ament_target_dependencies(
   "sensor_msgs"
   "camera_info_manager"
   "cv_bridge"
+  "std_srvs"
+  "image_transport"
 )
 
 target_include_directories(camera_component PUBLIC ${libcamera_INCLUDE_DIRS})

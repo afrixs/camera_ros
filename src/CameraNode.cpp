@@ -57,6 +57,7 @@
 #include <sensor_msgs/msg/detail/compressed_image__struct.hpp>
 #include <sensor_msgs/msg/detail/image__struct.hpp>
 #include <std_msgs/msg/detail/header__struct.hpp>
+#include <std_srvs/srv/set_bool.hpp>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
@@ -65,6 +66,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <image_transport/image_transport.hpp>
+
 namespace enc = sensor_msgs::image_encodings;
 namespace rclcpp
 {
@@ -89,7 +92,7 @@ private:
   std::vector<std::unique_ptr<libcamera::Request>> requests;
   std::vector<std::thread> request_threads;
   std::unordered_map<libcamera::Request *, std::unique_ptr<std::mutex>> request_locks;
-  std::atomic<bool> running;
+  std::atomic<bool> running = false;
 
   struct buffer_info_t
   {
@@ -101,9 +104,10 @@ private:
   // timestamp offset (ns) from camera time to system time
   int64_t time_offset = 0;
 
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_image;
-  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_image_compressed;
+
+  image_transport::Publisher pub_image;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr pub_ci;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr service_set_capture;
 
   camera_info_manager::CameraInfoManager cim;
 
@@ -118,6 +122,9 @@ private:
   std::mutex parameters_lock;
   // compression quality parameter
   std::atomic_uint8_t jpeg_quality;
+
+  bool
+  setCaptureEnabled(bool enabled);
 
   void
   declareParameters();
@@ -190,10 +197,22 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options) : Node("camera", opti
   // default to 95
   jpeg_quality = declare_parameter<uint8_t>("jpeg_quality", 95, jpeg_quality_description);
   // publisher for raw and compressed image
-  pub_image = this->create_publisher<sensor_msgs::msg::Image>("~/image_raw", 1);
-  pub_image_compressed =
-    this->create_publisher<sensor_msgs::msg::CompressedImage>("~/image_raw/compressed", 1);
-  pub_ci = this->create_publisher<sensor_msgs::msg::CameraInfo>("~/camera_info", 1);
+  pub_image = image_transport::create_publisher(this, "image_raw", rmw_qos_profile_sensor_data);
+  pub_ci = this->create_publisher<sensor_msgs::msg::CameraInfo>("camera_info", 1);
+
+  service_set_capture = this->create_service<std_srvs::srv::SetBool>(
+    "set_capture", [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+                            std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
+      bool success = setCaptureEnabled(request->data);
+      response->success = success;
+
+      if (success)
+        response->message = std::string("Capture ") + (request->data ? "enabled" : "disabled");
+      else
+        response->message = std::string("Failed to ") + (request->data ? "enable" : "disable") + " capture";
+
+      RCLCPP_INFO_STREAM(get_logger(), response->message);
+    });
 
   // start camera manager and check for cameras
   camera_manager.start();
@@ -356,59 +375,11 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options) : Node("camera", opti
   allocator = std::make_shared<libcamera::FrameBufferAllocator>(camera);
   allocator->allocate(stream);
 
-  for (const std::unique_ptr<libcamera::FrameBuffer> &buffer : allocator->buffers(stream)) {
-    std::unique_ptr<libcamera::Request> request = camera->createRequest();
-    if (!request)
-      throw std::runtime_error("Can't create request");
-
-    // multiple planes of the same buffer use the same file descriptor
-    size_t buffer_length = 0;
-    int fd = -1;
-    for (const libcamera::FrameBuffer::Plane &plane : buffer->planes()) {
-      if (plane.offset == libcamera::FrameBuffer::Plane::kInvalidOffset)
-        throw std::runtime_error("invalid offset");
-      buffer_length = std::max<size_t>(buffer_length, plane.offset + plane.length);
-      if (!plane.fd.isValid())
-        throw std::runtime_error("file descriptor is not valid");
-      if (fd == -1)
-        fd = plane.fd.get();
-      else if (fd != plane.fd.get())
-        throw std::runtime_error("plane file descriptors differ");
-    }
-
-    // memory-map the frame buffer planes
-    void *data = mmap(nullptr, buffer_length, PROT_READ, MAP_SHARED, fd, 0);
-    if (data == MAP_FAILED)
-      throw std::runtime_error("mmap failed: " + std::string(std::strerror(errno)));
-    buffer_info[buffer.get()] = {data, buffer_length};
-
-    if (request->addBuffer(stream, buffer.get()) < 0)
-      throw std::runtime_error("Can't set buffer for request");
-
-    requests.push_back(std::move(request));
-  }
-
-  // create a processing thread per request
-  for (const std::unique_ptr<libcamera::Request> &request : requests) {
-    request_locks[request.get()] = std::make_unique<std::mutex>();
-    request_locks[request.get()]->lock();
-    running = true;
-    request_threads.emplace_back(&CameraNode::process, this, request.get());
-  }
-
   // register callback
   camera->requestCompleted.connect(this, &CameraNode::requestComplete);
 
-  libcamera::ControlList controls_ = camera->controls();
-  for (const auto &[id, value] : parameters)
-    controls_.set(id, value);
-
-  // start camera and queue all requests
-  if (camera->start(&controls_))
+  if (!setCaptureEnabled(true))
     throw std::runtime_error("failed to start camera");
-
-  for (std::unique_ptr<libcamera::Request> &request : requests)
-    camera->queueRequest(request.get());
 }
 
 CameraNode::~CameraNode()
@@ -430,6 +401,81 @@ CameraNode::~CameraNode()
     if (munmap(e.second.data, e.second.size) == -1)
       std::cerr << "munmap failed: " << std::strerror(errno) << std::endl;
 }
+
+bool CameraNode::setCaptureEnabled(bool enabled) {
+  if (enabled) {
+    if (!running) {
+      requests.clear();
+      request_threads.clear();
+      for (const std::unique_ptr<libcamera::FrameBuffer> &buffer : allocator->buffers(stream)) {
+        std::unique_ptr<libcamera::Request> request = camera->createRequest();
+        if (!request)
+          throw std::runtime_error("Can't create request");
+
+        // multiple planes of the same buffer use the same file descriptor
+        size_t buffer_length = 0;
+        int fd = -1;
+        for (const libcamera::FrameBuffer::Plane &plane : buffer->planes()) {
+          if (plane.offset == libcamera::FrameBuffer::Plane::kInvalidOffset)
+            throw std::runtime_error("invalid offset");
+          buffer_length = std::max<size_t>(buffer_length, plane.offset + plane.length);
+          if (!plane.fd.isValid())
+            throw std::runtime_error("file descriptor is not valid");
+          if (fd == -1)
+            fd = plane.fd.get();
+          else if (fd != plane.fd.get())
+            throw std::runtime_error("plane file descriptors differ");
+        }
+
+        // memory-map the frame buffer planes
+        void *data = mmap(nullptr, buffer_length, PROT_READ, MAP_SHARED, fd, 0);
+        if (data == MAP_FAILED)
+          throw std::runtime_error("mmap failed: " + std::string(std::strerror(errno)));
+        buffer_info[buffer.get()] = {data, buffer_length};
+
+        if (request->addBuffer(stream, buffer.get()) < 0)
+          throw std::runtime_error("Can't set buffer for request");
+
+        requests.push_back(std::move(request));
+      }
+      // create a processing thread per request
+      for (const std::unique_ptr<libcamera::Request> &request : requests) {
+        request_locks[request.get()] = std::make_unique<std::mutex>();
+        request_locks[request.get()]->lock();
+        running = true;
+        request_threads.emplace_back(&CameraNode::process, this, request.get());
+      }
+    }
+
+    libcamera::ControlList controls_ = camera->controls();
+    for (const auto &[id, value] : parameters)
+      controls_.set(id, value);
+
+    // start camera and queue all requests
+    if (camera->start(&controls_)) {
+      running = false;
+      for (std::thread &thread : request_threads)
+        thread.join();
+      return false;
+    }
+    else {
+      for (std::unique_ptr<libcamera::Request> &request: requests)
+        camera->queueRequest(request.get());
+      return true;
+    }
+  }
+  else {
+    running = false;
+    for (std::thread &thread : request_threads)
+      thread.join();
+    request_threads.clear();
+
+    if (camera->stop())
+      return false;
+    else
+      return true;
+  }
+};
 
 void
 CameraNode::declareParameters()
@@ -622,17 +668,6 @@ CameraNode::process(libcamera::Request *const request)
         msg_img->is_bigendian = (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__);
         msg_img->data.resize(buffer_info[buffer].size);
         memcpy(msg_img->data.data(), buffer_info[buffer].data, buffer_info[buffer].size);
-
-        // compress to jpeg
-        if (pub_image_compressed->get_subscription_count()) {
-          try {
-            compressImageMsg(*msg_img, *msg_img_compressed,
-                             {cv::IMWRITE_JPEG_QUALITY, jpeg_quality});
-          }
-          catch (const cv_bridge::Exception &e) {
-            RCLCPP_ERROR_STREAM(get_logger(), e.what());
-          }
-        }
       }
       else if (format_type(cfg.pixelFormat) == FormatType::COMPRESSED) {
         // compressed image
@@ -643,7 +678,7 @@ CameraNode::process(libcamera::Request *const request)
         memcpy(msg_img_compressed->data.data(), buffer_info[buffer].data, bytesused);
 
         // decompress into raw rgb8 image
-        if (pub_image->get_subscription_count())
+        if (pub_image.getNumSubscribers())
           cv_bridge::toCvCopy(*msg_img_compressed, "rgb8")->toImageMsg(*msg_img);
       }
       else {
@@ -651,8 +686,7 @@ CameraNode::process(libcamera::Request *const request)
                                  stream->configuration().pixelFormat.toString());
       }
 
-      pub_image->publish(std::move(msg_img));
-      pub_image_compressed->publish(std::move(msg_img_compressed));
+      pub_image.publish(std::move(msg_img));
 
       sensor_msgs::msg::CameraInfo ci = cim.getCameraInfo();
       ci.header = hdr;
