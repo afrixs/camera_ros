@@ -404,47 +404,48 @@ CameraNode::~CameraNode()
 
 bool CameraNode::setCaptureEnabled(bool enabled) {
   if (enabled) {
-    if (!running) {
-      requests.clear();
-      request_threads.clear();
-      for (const std::unique_ptr<libcamera::FrameBuffer> &buffer : allocator->buffers(stream)) {
-        std::unique_ptr<libcamera::Request> request = camera->createRequest();
-        if (!request)
-          throw std::runtime_error("Can't create request");
+    if (running)
+      return true;  // already running
 
-        // multiple planes of the same buffer use the same file descriptor
-        size_t buffer_length = 0;
-        int fd = -1;
-        for (const libcamera::FrameBuffer::Plane &plane : buffer->planes()) {
-          if (plane.offset == libcamera::FrameBuffer::Plane::kInvalidOffset)
-            throw std::runtime_error("invalid offset");
-          buffer_length = std::max<size_t>(buffer_length, plane.offset + plane.length);
-          if (!plane.fd.isValid())
-            throw std::runtime_error("file descriptor is not valid");
-          if (fd == -1)
-            fd = plane.fd.get();
-          else if (fd != plane.fd.get())
-            throw std::runtime_error("plane file descriptors differ");
-        }
+    requests.clear();
+    request_threads.clear();
+    for (const std::unique_ptr<libcamera::FrameBuffer> &buffer : allocator->buffers(stream)) {
+      std::unique_ptr<libcamera::Request> request = camera->createRequest();
+      if (!request)
+        throw std::runtime_error("Can't create request");
 
-        // memory-map the frame buffer planes
-        void *data = mmap(nullptr, buffer_length, PROT_READ, MAP_SHARED, fd, 0);
-        if (data == MAP_FAILED)
-          throw std::runtime_error("mmap failed: " + std::string(std::strerror(errno)));
-        buffer_info[buffer.get()] = {data, buffer_length};
-
-        if (request->addBuffer(stream, buffer.get()) < 0)
-          throw std::runtime_error("Can't set buffer for request");
-
-        requests.push_back(std::move(request));
+      // multiple planes of the same buffer use the same file descriptor
+      size_t buffer_length = 0;
+      int fd = -1;
+      for (const libcamera::FrameBuffer::Plane &plane : buffer->planes()) {
+        if (plane.offset == libcamera::FrameBuffer::Plane::kInvalidOffset)
+          throw std::runtime_error("invalid offset");
+        buffer_length = std::max<size_t>(buffer_length, plane.offset + plane.length);
+        if (!plane.fd.isValid())
+          throw std::runtime_error("file descriptor is not valid");
+        if (fd == -1)
+          fd = plane.fd.get();
+        else if (fd != plane.fd.get())
+          throw std::runtime_error("plane file descriptors differ");
       }
-      // create a processing thread per request
-      for (const std::unique_ptr<libcamera::Request> &request : requests) {
-        request_locks[request.get()] = std::make_unique<std::mutex>();
-        request_locks[request.get()]->lock();
-        running = true;
-        request_threads.emplace_back(&CameraNode::process, this, request.get());
-      }
+
+      // memory-map the frame buffer planes
+      void *data = mmap(nullptr, buffer_length, PROT_READ, MAP_SHARED, fd, 0);
+      if (data == MAP_FAILED)
+        throw std::runtime_error("mmap failed: " + std::string(std::strerror(errno)));
+      buffer_info[buffer.get()] = {data, buffer_length};
+
+      if (request->addBuffer(stream, buffer.get()) < 0)
+        throw std::runtime_error("Can't set buffer for request");
+
+      requests.push_back(std::move(request));
+    }
+    // create a processing thread per request
+    for (const std::unique_ptr<libcamera::Request> &request : requests) {
+      request_locks[request.get()] = std::make_unique<std::mutex>();
+      request_locks[request.get()]->lock();
+      running = true;
+      request_threads.emplace_back(&CameraNode::process, this, request.get());
     }
 
     libcamera::ControlList controls_ = camera->controls();
@@ -465,6 +466,8 @@ bool CameraNode::setCaptureEnabled(bool enabled) {
     }
   }
   else {
+    if (!running)
+      return true;  // already stopped
     running = false;
     for (std::thread &thread : request_threads)
       thread.join();
