@@ -141,6 +141,8 @@ private:
   void
   process(libcamera::Request *const request);
 
+  bool stop();
+
   rcl_interfaces::msg::SetParametersResult
   onParameterChange(const std::vector<rclcpp::Parameter> &parameters);
 };
@@ -429,23 +431,7 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options) : Node("camera", opti
 
 CameraNode::~CameraNode()
 {
-  // stop request callbacks
-  for (std::unique_ptr<libcamera::Request> &request : requests)
-    camera->requestCompleted.disconnect(request.get());
-
-  // stop request processing threads
-  running = false;
-
-  // unlock all threads
-  for (auto &[req, condvar] : request_condvars)
-    condvar.notify_all();
-
-  // wait for all currently running threads to finish
-  for (std::thread &thread : request_threads)
-    thread.join();
-
-  // stop camera
-  if (camera->stop())
+  if (!stop())
     std::cerr << "failed to stop camera" << std::endl;
   allocator->free(stream);
   allocator.reset();
@@ -525,30 +511,29 @@ bool CameraNode::setCaptureEnabled(bool enabled) {
   else {
     if (!running)
       return true;  // already stopped
-    running = false;
-
-    // stop request callbacks
-    for (std::unique_ptr<libcamera::Request> &request : requests)
-      camera->requestCompleted.disconnect(request.get());
-
-    // stop request processing threads
-    running = false;
-
-    // unlock all threads
-    for (auto &[req, condvar] : request_condvars)
-      condvar.notify_all();
-
-    // wait for all currently running threads to finish
-    for (std::thread &thread : request_threads)
-      thread.join();
-    request_threads.clear();
-
-    if (camera->stop())
-      return false;
-    else
-      return true;
+    return stop();
   }
-};
+}
+
+bool CameraNode::stop() {
+  // stop request callbacks
+  for (std::unique_ptr<libcamera::Request> &request : requests)
+    camera->requestCompleted.disconnect(request.get());
+
+  // stop request processing threads
+  running = false;
+
+  // unlock all threads
+  for (auto &[req, condvar] : request_condvars)
+    condvar.notify_all();
+
+  // wait for all currently running threads to finish
+  for (std::thread &thread : request_threads)
+    thread.join();
+
+  // stop camera
+  return !camera->stop();
+}
 
 void
 CameraNode::declareParameters()
