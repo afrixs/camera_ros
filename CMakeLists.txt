@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.18)
 project(camera_ros)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -33,6 +33,7 @@ add_library(utils OBJECT
   src/type_extent.cpp
 )
 target_include_directories(utils PUBLIC ${libcamera_INCLUDE_DIRS})
+target_link_libraries(utils ${libcamera_LINK_LIBRARIES})
 ament_target_dependencies(
   utils
   "rclcpp"
@@ -43,12 +44,7 @@ set_property(TARGET utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 # composable ROS2 node
 add_library(camera_component SHARED src/CameraNode.cpp)
 rclcpp_components_register_node(camera_component PLUGIN "camera::CameraNode" EXECUTABLE "camera_node")
-
-target_include_directories(camera_component PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
-ament_target_dependencies(
-  camera_component
+set(PACKAGE_DEPENDENCIES
   "rclcpp"
   "rclcpp_components"
   "sensor_msgs"
@@ -57,11 +53,16 @@ ament_target_dependencies(
   "std_srvs"
   "image_transport"
 )
-
+ament_target_dependencies(camera_component PUBLIC ${PACKAGE_DEPENDENCIES})
 target_include_directories(camera_component PUBLIC ${libcamera_INCLUDE_DIRS})
-target_link_libraries(camera_component ${libcamera_LINK_LIBRARIES} utils)
+target_link_libraries(camera_component PUBLIC ${libcamera_LINK_LIBRARIES})
+target_link_libraries(camera_component PRIVATE utils)
+
+ament_export_targets(camera_componentTargets HAS_LIBRARY_TARGET)
+ament_export_dependencies(${PACKAGE_DEPENDENCIES})
 
 install(TARGETS camera_component
+  EXPORT camera_componentTargets
   DESTINATION lib)
 
 install(DIRECTORY
