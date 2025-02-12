@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include "DispatchQueue.h"
 #if __has_include(<cv_bridge/cv_bridge.hpp>)
 #include <cv_bridge/cv_bridge.hpp>
 #elif __has_include(<cv_bridge/cv_bridge.h>)
@@ -98,6 +99,7 @@ private:
   std::unordered_map<const libcamera::Request *, std::mutex> request_mutexes;
   std::unordered_map<const libcamera::Request *, std::condition_variable> request_condvars;
   std::atomic<bool> running = false;
+  rtv_utils::DispatchQueue publish_queue{"publish_queue", 1, true};
 
   struct buffer_info_t
   {
@@ -126,6 +128,7 @@ private:
   ParameterMap parameters_full;
   std::mutex parameters_mutex;
   std::unique_lock<std::mutex> parameters_lock {parameters_mutex, std::defer_lock};
+  std::mutex publish_mutex;
   // compression quality parameter
   std::atomic_uint8_t jpeg_quality;
 
@@ -243,7 +246,7 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options) : Node("camera", opti
   // default to 95
   jpeg_quality = declare_parameter<uint8_t>("jpeg_quality", 95, jpeg_quality_description);
   // publisher for raw and compressed image
-  pub_image = image_transport::create_publisher(this, "image_raw", rmw_qos_profile_sensor_data);
+  pub_image = image_transport::create_publisher(this, "image_raw", rclcpp::QoS(1).best_effort().get_rmw_qos_profile());
   pub_ci = this->create_publisher<sensor_msgs::msg::CameraInfo>("camera_info", 1);
 
   service_set_capture = this->create_service<std_srvs::srv::SetBool>(
@@ -480,6 +483,7 @@ bool CameraNode::setCaptureEnabled(bool enabled) {
         throw std::runtime_error("Can't set buffer for request");
 
       requests.push_back(std::move(request));
+      break;
     }
 
     // create a processing thread per request
@@ -691,7 +695,7 @@ CameraNode::process(libcamera::Request *const request)
       hdr.frame_id = "camera";
       const libcamera::StreamConfiguration &cfg = stream->configuration();
 
-      auto msg_img = std::make_unique<sensor_msgs::msg::Image>();
+      auto msg_img = std::make_shared<sensor_msgs::msg::Image>();
       auto msg_img_compressed = std::make_unique<sensor_msgs::msg::CompressedImage>();
 
       if (format_type(cfg.pixelFormat) == FormatType::RAW) {
@@ -723,11 +727,17 @@ CameraNode::process(libcamera::Request *const request)
                                  stream->configuration().pixelFormat.toString());
       }
 
-      pub_image.publish(std::move(msg_img));
+//       std::unique_lock<std::mutex> lock(publish_mutex);
+       publish_queue.dispatch([this, msg_img, hdr]() {
+        //
+        // RCLCPP_INFO(get_logger(), "publishing image %lf", rclcpp::Time(msg_img->header.stamp).seconds());
+        pub_image.publish(msg_img);
+        // RCLCPP_INFO(get_logger(), "publishing done");
 
-      sensor_msgs::msg::CameraInfo ci = cim.getCameraInfo();
-      ci.header = hdr;
-      pub_ci->publish(ci);
+        sensor_msgs::msg::CameraInfo ci = cim.getCameraInfo();
+        ci.header = hdr;
+        pub_ci->publish(ci);
+       });
     }
     else if (request->status() == libcamera::Request::RequestCancelled) {
       RCLCPP_ERROR_STREAM(get_logger(), "request '" << request->toString() << "' cancelled");

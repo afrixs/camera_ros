@@ -31,6 +31,7 @@ add_library(utils OBJECT
   src/pv_to_cv.cpp
   src/types.cpp
   src/type_extent.cpp
+  src/DispatchQueue.cpp
 )
 target_include_directories(utils PUBLIC ${libcamera_INCLUDE_DIRS})
 target_link_libraries(utils ${libcamera_LINK_LIBRARIES})
