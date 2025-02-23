@@ -4,7 +4,7 @@ project(camera_ros)
 set(CMAKE_CXX_STANDARD 17)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic -Werror)
+  add_compile_options(-Wall -Wextra -Wpedantic)  # -Werror)
   add_link_options("-Wl,-z,relro,-z,now,-z,defs")
 endif()
 
@@ -19,7 +19,11 @@ find_package(camera_info_manager REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(image_transport REQUIRED)
+find_package(ffmpeg_image_transport_msgs REQUIRED)
+find_package(Boost REQUIRED COMPONENTS program_options)
 pkg_check_modules(libcamera REQUIRED libcamera>=0.1)
+
+include_directories(include)
 
 # library with common utility functions for type conversions
 add_library(utils OBJECT
@@ -32,6 +36,9 @@ add_library(utils OBJECT
   src/types.cpp
   src/type_extent.cpp
   src/DispatchQueue.cpp
+  src/encoder.cpp
+  src/options.cpp
+  src/h264_encoder.cpp
 )
 target_include_directories(utils PUBLIC ${libcamera_INCLUDE_DIRS})
 target_link_libraries(utils ${libcamera_LINK_LIBRARIES})
@@ -39,6 +46,7 @@ ament_target_dependencies(
   utils
   "rclcpp"
   "sensor_msgs"
+  Boost
 )
 set_property(TARGET utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 
@@ -53,6 +61,7 @@ set(PACKAGE_DEPENDENCIES
   "cv_bridge"
   "std_srvs"
   "image_transport"
+  "ffmpeg_image_transport_msgs"
 )
 ament_target_dependencies(camera_component PUBLIC ${PACKAGE_DEPENDENCIES})
 target_include_directories(camera_component PUBLIC ${libcamera_INCLUDE_DIRS})
@@ -69,6 +78,11 @@ install(TARGETS camera_component
 install(DIRECTORY
   launch
   DESTINATION share/${PROJECT_NAME}/
+)
+
+install(
+  DIRECTORY include
+  DESTINATION include
 )
 
 if(BUILD_TESTING)

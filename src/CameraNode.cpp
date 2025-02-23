@@ -56,6 +56,9 @@
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
+#include <ffmpeg_image_transport_msgs/msg/ffmpeg_packet.hpp>
+#include <camera_ros/h264_encoder.hpp>
+#include "libcamera/formats.h"
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/header.hpp>
 #include <std_srvs/srv/set_bool.hpp>
@@ -82,6 +85,36 @@ class NodeOptions;
 
 namespace camera
 {
+
+class PacketEncoder {
+public:
+  PacketEncoder(const rclcpp::Publisher<ffmpeg_image_transport_msgs::msg::FFMPEGPacket>::SharedPtr &ffmpeg_image_pub);
+  void encodeMessage(const libcamera::FrameBuffer *buffer, const std_msgs::msg::Header &header, const libcamera::StreamConfiguration &cfg);
+private:
+  enum Flag
+  {
+    FLAG_NONE = 0,
+    FLAG_KEYFRAME = 1,
+    FLAG_RESTART = 2
+  };
+  enum State
+  {
+    DISABLED = 0,
+    WAITING_KEYFRAME = 1,
+    RUNNING = 2
+  };
+  std::shared_ptr<VideoOptions> video_options_;
+  std::shared_ptr<StreamInfo> stream_info_;
+  std::shared_ptr<H264Encoder> encoder_;
+  State state_ = DISABLED;
+  std::mutex encoder_mutex_;
+  bool enabled_ = true;
+  std::queue<std_msgs::msg::Header> encoded_image_headers_queue_;
+  rclcpp::Publisher<ffmpeg_image_transport_msgs::msg::FFMPEGPacket>::SharedPtr ffmpeg_image_pub_;
+  void outputReady(void *mem, size_t size, int64_t timestamp_us, bool keyframe);
+  void outputBuffer(void *mem, size_t size, uint32_t flags, const std_msgs::msg::Header &header);
+};
+
 class CameraNode : public rclcpp::Node
 {
 public:
@@ -113,8 +146,12 @@ private:
 
 
   image_transport::Publisher pub_image;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_image_pure;
+  rclcpp::Publisher<ffmpeg_image_transport_msgs::msg::FFMPEGPacket>::SharedPtr pub_image_ffmpeg;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr pub_ci;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr service_set_capture;
+
+  std::shared_ptr<PacketEncoder> ffmpeg_encoder;
 
   camera_info_manager::CameraInfoManager cim;
 
@@ -131,6 +168,7 @@ private:
   std::mutex publish_mutex;
   // compression quality parameter
   std::atomic_uint8_t jpeg_quality;
+  bool publish_via_image_transport;
 
   bool
   setCaptureEnabled(bool enabled);
@@ -233,6 +271,8 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options) : Node("camera", opti
   // camera ID
   declare_parameter("camera", rclcpp::ParameterValue {}, param_descr_ro.set__dynamic_typing(true));
 
+  declare_parameter("publish_via_image_transport", true);
+
   rcl_interfaces::msg::ParameterDescriptor jpeg_quality_description;
   jpeg_quality_description.name = "jpeg_quality";
   jpeg_quality_description.type = rcl_interfaces::msg::ParameterType::PARAMETER_INTEGER;
@@ -246,7 +286,15 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options) : Node("camera", opti
   // default to 95
   jpeg_quality = declare_parameter<uint8_t>("jpeg_quality", 95, jpeg_quality_description);
   // publisher for raw and compressed image
-  pub_image = image_transport::create_publisher(this, "image_raw", rclcpp::QoS(1).best_effort().get_rmw_qos_profile());
+  publish_via_image_transport = get_parameter("publish_via_image_transport").as_bool();
+  if (publish_via_image_transport) {
+    pub_image = image_transport::create_publisher(this, "image_raw", rclcpp::QoS(1).best_effort().get_rmw_qos_profile());
+  }
+  else {
+    pub_image_pure = this->create_publisher<sensor_msgs::msg::Image>("image_raw", 1);
+    pub_image_ffmpeg = this->create_publisher<ffmpeg_image_transport_msgs::msg::FFMPEGPacket>("image_raw/ffmpeg", 1);
+    ffmpeg_encoder = std::make_shared<PacketEncoder>(pub_image_ffmpeg);
+  }
   pub_ci = this->create_publisher<sensor_msgs::msg::CameraInfo>("camera_info", 1);
 
   service_set_capture = this->create_service<std_srvs::srv::SetBool>(
@@ -695,32 +743,48 @@ CameraNode::process(libcamera::Request *const request)
       hdr.frame_id = "camera";
       const libcamera::StreamConfiguration &cfg = stream->configuration();
 
-      auto msg_img = std::make_shared<sensor_msgs::msg::Image>();
-      auto msg_img_compressed = std::make_unique<sensor_msgs::msg::CompressedImage>();
+      bool publish_image = (publish_via_image_transport && pub_image.getNumSubscribers() > 0) || pub_image_pure->get_subscription_count() > 0;
+      bool publish_ffmpeg = !publish_via_image_transport && pub_image_ffmpeg->get_subscription_count() > 0;
+
+      sensor_msgs::msg::Image::SharedPtr msg_img;
+      ffmpeg_image_transport_msgs::msg::FFMPEGPacket::SharedPtr ffmpeg_packet;
 
       if (format_type(cfg.pixelFormat) == FormatType::RAW) {
         // raw uncompressed image
         assert(buffer_info[buffer].size == bytesused);
-        msg_img->header = hdr;
-        msg_img->width = cfg.size.width;
-        msg_img->height = cfg.size.height;
-        msg_img->step = cfg.stride;
-        msg_img->encoding = get_ros_encoding(cfg.pixelFormat);
-        msg_img->is_bigendian = (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__);
-        msg_img->data.resize(buffer_info[buffer].size);
-        memcpy(msg_img->data.data(), buffer_info[buffer].data, buffer_info[buffer].size);
+        if (publish_image) {
+          msg_img = std::make_shared<sensor_msgs::msg::Image>();
+          msg_img->header = hdr;
+          msg_img->width = cfg.size.width;
+          msg_img->height = cfg.size.height;
+          msg_img->step = cfg.stride;
+          msg_img->encoding = get_ros_encoding(cfg.pixelFormat);
+          msg_img->is_bigendian = (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__);
+          msg_img->data.resize(buffer_info[buffer].size);
+          memcpy(msg_img->data.data(), buffer_info[buffer].data, buffer_info[buffer].size);
+        }
+        if (publish_ffmpeg) {
+          ffmpeg_encoder->encodeMessage(buffer, hdr, cfg);
+        }
       }
       else if (format_type(cfg.pixelFormat) == FormatType::COMPRESSED) {
         // compressed image
         assert(bytesused < buffer_info[buffer].size);
-        msg_img_compressed->header = hdr;
-        msg_img_compressed->format = get_ros_encoding(cfg.pixelFormat);
-        msg_img_compressed->data.resize(bytesused);
-        memcpy(msg_img_compressed->data.data(), buffer_info[buffer].data, bytesused);
 
         // decompress into raw rgb8 image
-        if (pub_image.getNumSubscribers())
+        if (publish_image) {
+          auto msg_img_compressed = std::make_unique<sensor_msgs::msg::CompressedImage>();
+          msg_img_compressed->header = hdr;
+          msg_img_compressed->format = get_ros_encoding(cfg.pixelFormat);
+          msg_img_compressed->data.resize(bytesused);
+          memcpy(msg_img_compressed->data.data(), buffer_info[buffer].data, bytesused);
+
+          msg_img = std::make_shared<sensor_msgs::msg::Image>();
           cv_bridge::toCvCopy(*msg_img_compressed, "rgb8")->toImageMsg(*msg_img);
+        }
+        if (publish_ffmpeg) {
+          ffmpeg_encoder->encodeMessage(buffer, hdr, cfg);
+        }
       }
       else {
         throw std::runtime_error("unsupported pixel format: " +
@@ -728,16 +792,29 @@ CameraNode::process(libcamera::Request *const request)
       }
 
 //       std::unique_lock<std::mutex> lock(publish_mutex);
-       publish_queue.dispatch([this, msg_img, hdr]() {
-        //
-        // RCLCPP_INFO(get_logger(), "publishing image %lf", rclcpp::Time(msg_img->header.stamp).seconds());
-        pub_image.publish(msg_img);
-        // RCLCPP_INFO(get_logger(), "publishing done");
+      if (publish_image)
+        publish_queue.dispatch([this, msg_img, hdr, ffmpeg_packet]() {
+          //
+          // RCLCPP_INFO(get_logger(), "publishing image %lf", rclcpp::Time(msg_img->header.stamp).seconds());
+          if (publish_via_image_transport)
+            pub_image.publish(msg_img);
+          else {
+            if (msg_img)
+              pub_image_pure->publish(*msg_img);
+            if (ffmpeg_packet)
+              pub_image_ffmpeg->publish(*ffmpeg_packet);
+          }
+          // RCLCPP_INFO(get_logger(), "publishing done");
 
+          sensor_msgs::msg::CameraInfo ci = cim.getCameraInfo();
+          ci.header = hdr;
+          pub_ci->publish(ci);
+        });
+      else {
         sensor_msgs::msg::CameraInfo ci = cim.getCameraInfo();
         ci.header = hdr;
         pub_ci->publish(ci);
-       });
+      }
     }
     else if (request->status() == libcamera::Request::RequestCancelled) {
       RCLCPP_ERROR_STREAM(get_logger(), "request '" << request->toString() << "' cancelled");
@@ -761,6 +838,70 @@ CameraNode::process(libcamera::Request *const request)
 
     camera->queueRequest(request);
   }
+}
+
+PacketEncoder::PacketEncoder(const rclcpp::Publisher<ffmpeg_image_transport_msgs::msg::FFMPEGPacket>::SharedPtr &ffmpeg_image_pub)
+{
+  ffmpeg_image_pub_ = ffmpeg_image_pub;
+}
+
+void PacketEncoder::encodeMessage(const libcamera::FrameBuffer *buffer, const std_msgs::msg::Header &header, const libcamera::StreamConfiguration &cfg) {
+  RCLCPP_INFO(rclcpp::get_logger("PacketEncoder"), "encoding message");
+  std::unique_lock<std::mutex> lock(encoder_mutex_);
+  if (enabled_ && !encoder_) {
+    RCLCPP_INFO(rclcpp::get_logger("PacketEncoder"), "creating encoder");
+    stream_info_ = std::make_shared<StreamInfo>();
+    stream_info_->width = cfg.size.width;
+    stream_info_->height = cfg.size.height;
+    stream_info_->stride = cfg.stride;
+    stream_info_->pixel_format = cfg.pixelFormat;
+
+    video_options_ = std::make_shared<VideoOptions>();
+    encoder_ = std::make_shared<H264Encoder>(video_options_.get(), *stream_info_);
+    encoder_->SetOutputReadyCallback(std::bind(&PacketEncoder::outputReady, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4));
+  }
+  if (encoder_) {
+    encoded_image_headers_queue_.push(header);
+    auto stamp = header.stamp;
+    RCLCPP_INFO(rclcpp::get_logger("PacketEncoder"), "using encoder");
+    encoder_->EncodeBuffer(buffer->planes()[0].fd.get(), cfg.stride * cfg.size.height, nullptr, *stream_info_, stamp.sec * 1000000 + stamp.nanosec / 1000);
+  }
+}
+
+void PacketEncoder::outputReady(void *mem, size_t size, int64_t timestamp_us, bool keyframe)
+{
+  RCLCPP_INFO(rclcpp::get_logger("PacketEncoder"), "output ready");
+  std::unique_lock<std::mutex> lock(encoder_mutex_);
+  // When output is enabled, we may have to wait for the next keyframe.
+  uint32_t flags = keyframe ? FLAG_KEYFRAME : FLAG_NONE;
+  if (!encoder_)
+    state_ = DISABLED;
+  else if (state_ == DISABLED)
+    state_ = WAITING_KEYFRAME;
+  if (state_ == WAITING_KEYFRAME && keyframe)
+    state_ = RUNNING, flags |= FLAG_RESTART;
+  if (state_ != RUNNING)
+    return;
+
+  RCLCPP_INFO(rclcpp::get_logger("PacketEncoder"), "outputBuffer");
+  const auto &header = encoded_image_headers_queue_.front();
+  outputBuffer(mem, size, flags, header);
+  encoded_image_headers_queue_.pop();
+}
+
+void PacketEncoder::outputBuffer(void *mem, size_t size, uint32_t flags, const std_msgs::msg::Header &header)
+{
+  ffmpeg_image_transport_msgs::msg::FFMPEGPacket packet;
+  packet.header = header;
+  packet.data.resize(size);
+  memcpy(packet.data.data(), mem, size);
+  packet.flags = flags;
+  packet.encoding = "h264";
+  packet.width = stream_info_->width;
+  packet.height = stream_info_->height;
+  packet.pts = packet.width*packet.height;
+  RCLCPP_INFO(rclcpp::get_logger("PacketEncoder"), "publishing");
+  ffmpeg_image_pub_->publish(packet);
 }
 
 rcl_interfaces::msg::SetParametersResult
