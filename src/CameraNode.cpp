@@ -86,10 +86,16 @@ class NodeOptions;
 namespace camera
 {
 
+struct buffer_info_t
+{
+  void *data;
+  size_t size;
+};
+
 class PacketEncoder {
 public:
   PacketEncoder(const rclcpp::Publisher<ffmpeg_image_transport_msgs::msg::FFMPEGPacket>::SharedPtr &ffmpeg_image_pub);
-  void encodeMessage(const libcamera::FrameBuffer *buffer, const std_msgs::msg::Header &header, const libcamera::StreamConfiguration &cfg);
+  void encodeMessage(const libcamera::FrameBuffer *buffer, const std_msgs::msg::Header &header, const buffer_info_t &buffer_info, const libcamera::StreamConfiguration &cfg);
 private:
   enum Flag
   {
@@ -134,11 +140,6 @@ private:
   std::atomic<bool> running = false;
   rtv_utils::DispatchQueue publish_queue{"publish_queue", 1, true};
 
-  struct buffer_info_t
-  {
-    void *data;
-    size_t size;
-  };
   std::unordered_map<const libcamera::FrameBuffer *, buffer_info_t> buffer_info;
 
   // timestamp offset (ns) from camera time to system time
@@ -522,7 +523,7 @@ bool CameraNode::setCaptureEnabled(bool enabled) {
       }
 
       // memory-map the frame buffer planes
-      void *data = mmap(nullptr, buffer_length, PROT_READ, MAP_SHARED, fd, 0);
+      void *data = mmap(nullptr, buffer_length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
       if (data == MAP_FAILED)
         throw std::runtime_error("mmap failed: " + std::string(std::strerror(errno)));
       buffer_info[buffer.get()] = {data, buffer_length};
@@ -743,7 +744,7 @@ CameraNode::process(libcamera::Request *const request)
       hdr.frame_id = "camera";
       const libcamera::StreamConfiguration &cfg = stream->configuration();
 
-      bool publish_image = (publish_via_image_transport && pub_image.getNumSubscribers() > 0) || pub_image_pure->get_subscription_count() > 0;
+      bool publish_image = (publish_via_image_transport && pub_image.getNumSubscribers() > 0) || (pub_image_pure && pub_image_pure->get_subscription_count() > 0);
       bool publish_ffmpeg = !publish_via_image_transport && pub_image_ffmpeg->get_subscription_count() > 0;
 
       sensor_msgs::msg::Image::SharedPtr msg_img;
@@ -764,7 +765,7 @@ CameraNode::process(libcamera::Request *const request)
           memcpy(msg_img->data.data(), buffer_info[buffer].data, buffer_info[buffer].size);
         }
         if (publish_ffmpeg) {
-          ffmpeg_encoder->encodeMessage(buffer, hdr, cfg);
+          ffmpeg_encoder->encodeMessage(buffer, hdr, buffer_info[buffer], cfg);
         }
       }
       else if (format_type(cfg.pixelFormat) == FormatType::COMPRESSED) {
@@ -783,7 +784,7 @@ CameraNode::process(libcamera::Request *const request)
           cv_bridge::toCvCopy(*msg_img_compressed, "rgb8")->toImageMsg(*msg_img);
         }
         if (publish_ffmpeg) {
-          ffmpeg_encoder->encodeMessage(buffer, hdr, cfg);
+          ffmpeg_encoder->encodeMessage(buffer, hdr, buffer_info[buffer], cfg);
         }
       }
       else {
@@ -845,7 +846,7 @@ PacketEncoder::PacketEncoder(const rclcpp::Publisher<ffmpeg_image_transport_msgs
   ffmpeg_image_pub_ = ffmpeg_image_pub;
 }
 
-void PacketEncoder::encodeMessage(const libcamera::FrameBuffer *buffer, const std_msgs::msg::Header &header, const libcamera::StreamConfiguration &cfg) {
+void PacketEncoder::encodeMessage(const libcamera::FrameBuffer *buffer, const std_msgs::msg::Header &header, const buffer_info_t &buffer_info, const libcamera::StreamConfiguration &cfg) {
   RCLCPP_INFO(rclcpp::get_logger("PacketEncoder"), "encoding message");
   std::unique_lock<std::mutex> lock(encoder_mutex_);
   if (enabled_ && !encoder_) {
@@ -855,16 +856,22 @@ void PacketEncoder::encodeMessage(const libcamera::FrameBuffer *buffer, const st
     stream_info_->height = cfg.size.height;
     stream_info_->stride = cfg.stride;
     stream_info_->pixel_format = cfg.pixelFormat;
+    stream_info_->colour_space = cfg.colorSpace;
 
     video_options_ = std::make_shared<VideoOptions>();
+    video_options_->Parse(0, nullptr);
+    video_options_->width = stream_info_->width;
+    video_options_->height = stream_info_->height;
     encoder_ = std::make_shared<H264Encoder>(video_options_.get(), *stream_info_);
     encoder_->SetOutputReadyCallback(std::bind(&PacketEncoder::outputReady, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4));
   }
   if (encoder_) {
     encoded_image_headers_queue_.push(header);
     auto stamp = header.stamp;
+    RCLCPP_INFO(rclcpp::get_logger("PacketEncoder"), "pixel format: %s, color space %s, size: %lu",
+                cfg.pixelFormat.toString().c_str(), cfg.colorSpace->toString().c_str(), buffer_info.size);
     RCLCPP_INFO(rclcpp::get_logger("PacketEncoder"), "using encoder");
-    encoder_->EncodeBuffer(buffer->planes()[0].fd.get(), cfg.stride * cfg.size.height, nullptr, *stream_info_, stamp.sec * 1000000 + stamp.nanosec / 1000);
+    encoder_->EncodeBuffer(buffer->planes()[0].fd.get(), buffer_info.size, nullptr, *stream_info_, stamp.sec * 1000000 + stamp.nanosec / 1000);
   }
 }
 
