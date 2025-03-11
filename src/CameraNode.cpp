@@ -117,6 +117,7 @@ private:
   bool enabled_ = true;
   std::queue<std_msgs::msg::Header> encoded_image_headers_queue_;
   rclcpp::Publisher<ffmpeg_image_transport_msgs::msg::FFMPEGPacket>::SharedPtr ffmpeg_image_pub_;
+  void encodeBufferDone(void *mem);
   void outputReady(void *mem, size_t size, int64_t timestamp_us, bool keyframe);
   void outputBuffer(void *mem, size_t size, uint32_t flags, const std_msgs::msg::Header &header);
 };
@@ -864,6 +865,7 @@ void PacketEncoder::encodeMessage(const libcamera::FrameBuffer *buffer, const st
     video_options_->height = stream_info_->height;
     encoder_ = std::make_shared<H264Encoder>(video_options_.get(), *stream_info_);
     encoder_->SetOutputReadyCallback(std::bind(&PacketEncoder::outputReady, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4));
+    encoder_->SetInputDoneCallback(std::bind(&PacketEncoder::encodeBufferDone, this, std::placeholders::_1));
   }
   if (encoder_) {
     encoded_image_headers_queue_.push(header);
@@ -873,6 +875,11 @@ void PacketEncoder::encodeMessage(const libcamera::FrameBuffer *buffer, const st
     RCLCPP_INFO(rclcpp::get_logger("PacketEncoder"), "using encoder");
     encoder_->EncodeBuffer(buffer->planes()[0].fd.get(), buffer_info.size, nullptr, *stream_info_, stamp.sec * 1000000 + stamp.nanosec / 1000);
   }
+}
+
+void PacketEncoder::encodeBufferDone(void *mem)
+{
+  RCLCPP_INFO(rclcpp::get_logger("PacketEncoder"), "encodeBufferDone");
 }
 
 void PacketEncoder::outputReady(void *mem, size_t size, int64_t timestamp_us, bool keyframe)
