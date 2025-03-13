@@ -9,8 +9,8 @@
 
 #include <functional>
 
-#include "camera_ros/stream_info.hpp"
-#include "camera_ros/video_options.hpp"
+#include "stream_info.hpp"
+#include "video_options.hpp"
 
 typedef std::function<void(void *)> InputDoneCallback;
 typedef std::function<void(void *, size_t, int64_t, bool)> OutputReadyCallback;

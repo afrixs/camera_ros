@@ -12,7 +12,7 @@
 #include <queue>
 #include <thread>
 
-#include "camera_ros/encoder.hpp"
+#include "encoder.hpp"
 
 class H264Encoder : public Encoder
 {

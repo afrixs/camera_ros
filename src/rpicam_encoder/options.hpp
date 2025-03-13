@@ -20,7 +20,7 @@
 #include <libcamera/property_ids.h>
 #include <libcamera/transform.h>
 
-#include "camera_ros/logging.hpp"
+#include "logging.hpp"
 // #include "core/version.hpp"
 
 static constexpr double DEFAULT_FRAMERATE = 30.0;

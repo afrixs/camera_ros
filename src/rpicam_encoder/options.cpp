@@ -19,7 +19,7 @@
 #include <libcamera/logging.h>
 #include <libcamera/property_ids.h>
 
-#include "camera_ros/options.hpp"
+#include "options.hpp"
 
 namespace fs = std::filesystem;
 using namespace libcamera;
@@ -112,7 +112,7 @@ static int xioctl(int fd, unsigned long ctl, void *arg)
 	return ret;
 }
 
-static bool set_imx708_subdev_hdr_ctrl(int en, const std::string &cam_id)
+[[maybe_unused]] static bool set_imx708_subdev_hdr_ctrl(int en, const std::string &cam_id)
 {
 	for (unsigned int i = 0; i < 16; i++)
 	{

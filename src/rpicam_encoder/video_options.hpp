@@ -11,7 +11,7 @@
 
 #include <string>
 
-#include "camera_ros/options.hpp"
+#include "options.hpp"
 
 struct Bitrate
 {

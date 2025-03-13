@@ -23,8 +23,6 @@ find_package(ffmpeg_image_transport_msgs REQUIRED)
 find_package(Boost REQUIRED COMPONENTS program_options)
 pkg_check_modules(libcamera REQUIRED libcamera>=0.1)
 
-include_directories(include)
-
 # library with common utility functions for type conversions
 add_library(utils OBJECT
   src/clamp.cpp
@@ -36,9 +34,10 @@ add_library(utils OBJECT
   src/types.cpp
   src/type_extent.cpp
   src/DispatchQueue.cpp
-  src/encoder.cpp
-  src/options.cpp
-  src/h264_encoder.cpp
+  src/rpicam_encoder/encoder.cpp
+  src/rpicam_encoder/options.cpp
+  src/rpicam_encoder/h264_encoder.cpp
+  src/rpicam_encoder/rpicam_encoder.cpp
 )
 target_include_directories(utils PUBLIC ${libcamera_INCLUDE_DIRS})
 target_link_libraries(utils ${libcamera_LINK_LIBRARIES})
@@ -46,6 +45,7 @@ ament_target_dependencies(
   utils
   "rclcpp"
   "sensor_msgs"
+  "ffmpeg_image_transport_msgs"
   Boost
 )
 set_property(TARGET utils PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -78,11 +78,6 @@ install(TARGETS camera_component
 install(DIRECTORY
   launch
   DESTINATION share/${PROJECT_NAME}/
-)
-
-install(
-  DIRECTORY include
-  DESTINATION include
 )
 
 if(BUILD_TESTING)

@@ -12,8 +12,8 @@
 
 #include <linux/videodev2.h>
 
-#include "camera_ros/encoder.hpp"
-#include "camera_ros/h264_encoder.hpp"
+#include "encoder.hpp"
+#include "h264_encoder.hpp"
 
 #if LIBAV_PRESENT
 #include "libav_encoder.hpp"

@@ -15,7 +15,7 @@
 #include <chrono>
 #include <iostream>
 
-#include "camera_ros/h264_encoder.hpp"
+#include "h264_encoder.hpp"
 
 static int xioctl(int fd, unsigned long ctl, void *arg)
 {
@@ -110,7 +110,7 @@ H264Encoder::H264Encoder(VideoOptions const *options, StreamInfo const &info)
 	fmt.fmt.pix_mp.height = info.height;
 	// We assume YUV420 here, but it would be nice if we could do something
 	// like info.pixel_format.toV4L2Fourcc();
-	fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_YUV420;
+	fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV21;
 	fmt.fmt.pix_mp.plane_fmt[0].bytesperline = info.stride;
 	fmt.fmt.pix_mp.field = V4L2_FIELD_ANY;
 	fmt.fmt.pix_mp.colorspace = get_v4l2_colorspace(info.colour_space);
@@ -243,7 +243,7 @@ H264Encoder::~H264Encoder()
 	LOG(2, "H264Encoder closed");
 }
 
-void H264Encoder::EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const &info, int64_t timestamp_us)
+void H264Encoder::EncodeBuffer(int fd, size_t size, [[maybe_unused]] void *mem, [[maybe_unused]] StreamInfo const &info, int64_t timestamp_us)
 {
 	int index;
 	{
